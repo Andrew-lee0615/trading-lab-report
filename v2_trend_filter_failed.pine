@@ -1,0 +1,79 @@
+//@version=5
+strategy("SOXL RSI Reversal Strategy v2 (1H)", overlay=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.05)
+
+// ============ INPUTS ============
+rsiLength = input.int(14, "RSI Length", group="RSI")
+oversold = input.int(35, "Oversold Level (Buy Trigger)", group="RSI")
+buyMode = input.string("Cross Back Above", "Buy Trigger Mode", options=["Cross Below", "Cross Back Above"], group="RSI")
+
+exitTarget = input.int(58, "1st Exit Target RSI", group="RSI")
+useRollover = input.bool(true, "Use Momentum Rollover Exit", group="RSI")
+rolloverPeak = input.int(60, "Rollover Peak RSI", group="RSI")
+rolloverDrop = input.int(3, "Rollover Confirm Drop", group="RSI")
+
+useTrendFilter = input.bool(true, "Use Trend Filter (SMA)", group="Trend Filter")
+smaLength = input.int(60, "Trend Filter SMA Length", group="Trend Filter")
+
+stopMode = input.string("ATR", "Stop Loss Mode", options=["Fixed %", "ATR"], group="Stop Loss")
+stopPct = input.float(6.0, "Fixed Stop %", step=0.5, group="Stop Loss")
+atrLength = input.int(14, "ATR Length", group="Stop Loss")
+atrMult = input.float(2.0, "ATR Multiplier", step=0.25, group="Stop Loss")
+
+useTimeFilter = input.bool(false, "Use Time Filter (RTH only)", group="Other")
+
+// ============ INDICATORS ============
+rsiVal = ta.rsi(close, rsiLength)
+smaVal = ta.sma(close, smaLength)
+atrVal = ta.atr(atrLength)
+
+// ============ ENTRY LOGIC ============
+crossBelow = ta.crossunder(rsiVal, oversold)
+crossBackAbove = ta.crossover(rsiVal, oversold)
+buySignal = buyMode == "Cross Below" ? crossBelow : crossBackAbove
+
+trendOK = useTrendFilter ? close > smaVal : true
+
+inSession = true
+if useTimeFilter
+    inSession := hour(time, "America/New_York") >= 9 and hour(time, "America/New_York") < 16
+
+longCondition = buySignal and trendOK and inSession and strategy.position_size == 0
+
+// ============ EXIT LOGIC ============
+var float peakRsiSinceEntry = na
+var float stopPriceFixed = na
+
+if strategy.position_size > 0
+    peakRsiSinceEntry := na(peakRsiSinceEntry) ? rsiVal : math.max(peakRsiSinceEntry, rsiVal)
+else
+    peakRsiSinceEntry := na
+
+rolloverExit = useRollover and not na(peakRsiSinceEntry) and peakRsiSinceEntry >= rolloverPeak and ta.crossunder(rsiVal, rolloverPeak - rolloverDrop)
+targetExit = ta.crossover(rsiVal, exitTarget)
+exitCondition = targetExit or rolloverExit
+
+// ============ ENTRY / EXIT EXECUTION ============
+if longCondition
+    strategy.entry("Long", strategy.long)
+    stopPriceFixed := stopMode == "ATR" ? close - atrVal * atrMult : close * (1 - stopPct / 100)
+
+if strategy.position_size > 0
+    strategy.exit("Stop/Exit", "Long", stop=stopPriceFixed)
+    if exitCondition
+        strategy.close("Long", comment=targetExit ? "RSI Target" : "Rollover")
+
+if strategy.position_size == 0
+    stopPriceFixed := na
+
+// ============ PLOTS ============
+plot(rsiVal, "RSI", color=color.new(color.blue, 0), linewidth=2)
+hline(oversold, "Oversold", color=color.red, linestyle=hline.style_dashed)
+hline(exitTarget, "Exit Target", color=color.green, linestyle=hline.style_dashed)
+hline(rolloverPeak, "Rollover Peak", color=color.orange, linestyle=hline.style_dotted)
+hline(50, "50", color=color.gray, linestyle=hline.style_dotted)
+
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 90) : na)
+
+// ============ ALERTS ============
+alertcondition(longCondition, "SOXL RSI Buy", "RSI Buy Signal")
+alertcondition(exitCondition, "SOXL RSI Sell", "RSI Sell Signal")

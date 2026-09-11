@@ -1,0 +1,141 @@
+//@version=5
+strategy("SOXL RSI Reversal Strategy v6 (Fixed 70%)", overlay=false, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.05)
+
+// ============ INPUTS ============
+positionSizePct = input.float(70.0, "Base Position Size (% of Equity)", minval=1, maxval=200, step=5, group="Position Sizing")
+
+useKelly = input.bool(false, "Use Kelly Criterion Sizing", group="Kelly Sizing")
+minTradesForKelly = input.int(15, "Min Closed Trades Before Kelly Kicks In", group="Kelly Sizing")
+kellyFraction = input.float(1.0, "Kelly Fraction (0.5 = Half Kelly, 1.0 = Full Kelly)", step=0.1, group="Kelly Sizing")
+minPositionPct = input.float(10.0, "Min Position Size Floor %", group="Kelly Sizing")
+maxPositionPct = input.float(150.0, "Max Position Size Cap %", group="Kelly Sizing")
+
+rsiLength = input.int(14, "RSI Length", group="RSI")
+oversold = input.int(35, "Oversold Level (Buy Trigger)", group="RSI")
+buyMode = input.string("Cross Back Above", "Buy Trigger Mode", options=["Cross Below", "Cross Back Above"], group="RSI")
+
+exitTarget = input.int(58, "Final Exit Target RSI", group="RSI")
+useRollover = input.bool(true, "Use Momentum Rollover Exit", group="RSI")
+rolloverPeak = input.int(60, "Rollover Peak RSI", group="RSI")
+rolloverDrop = input.int(3, "Rollover Confirm Drop", group="RSI")
+
+usePartialTP = input.bool(false, "Use Partial Take-Profit", group="Partial TP")
+partialLevel = input.int(50, "Partial TP RSI Level", group="Partial TP")
+partialPct = input.float(50.0, "Partial TP Close %", minval=1, maxval=99, step=5, group="Partial TP")
+
+useTrendFilter = input.bool(true, "Use Trend Filter (SMA Slope)", group="Trend Filter")
+smaLength = input.int(150, "Trend Filter SMA Length", group="Trend Filter")
+slopeLookback = input.int(20, "Slope Lookback (bars)", group="Trend Filter")
+
+stopMode = input.string("ATR", "Stop Loss Mode", options=["Fixed %", "ATR"], group="Stop Loss")
+stopPct = input.float(6.0, "Fixed Stop %", step=0.5, group="Stop Loss")
+atrLength = input.int(14, "ATR Length", group="Stop Loss")
+atrMult = input.float(2.0, "ATR Multiplier", step=0.25, group="Stop Loss")
+maxStopPct = input.float(8.0, "Max Stop Loss % (Cap)", step=0.5, group="Stop Loss")
+
+useVolFilter = input.bool(true, "Block Entry on Volatility Spike", group="Volatility Filter")
+volAvgLength = input.int(50, "ATR Average Lookback", group="Volatility Filter")
+volSpikeMult = input.float(1.5, "Spike Threshold (x Average ATR)", step=0.1, group="Volatility Filter")
+
+useTimeFilter = input.bool(false, "Use Time Filter (RTH only)", group="Other")
+
+startDate = input.time(timestamp("2023-01-03T00:00:00"), "Backtest Start Date", group="Date Range")
+endDate = input.time(timestamp("2026-09-11T00:00:00"), "Backtest End Date", group="Date Range")
+
+// ============ INDICATORS ============
+rsiVal = ta.rsi(close, rsiLength)
+smaVal = ta.sma(close, smaLength)
+atrVal = ta.atr(atrLength)
+
+// 추세 필터: 가격 위치가 아니라 SMA 자체의 기울기(방향)만 체크
+smaSlopeUp = smaVal > smaVal[slopeLookback]
+
+// 변동성 급등 필터: 최근 ATR이 평균 ATR 대비 너무 크면(변동성 폭발 직후) 진입 차단
+atrAvg = ta.sma(atrVal, volAvgLength)
+volSpike = atrVal > atrAvg * volSpikeMult
+volOK = useVolFilter ? not volSpike : true
+
+// ============ ENTRY LOGIC ============
+crossBelow = ta.crossunder(rsiVal, oversold)
+crossBackAbove = ta.crossover(rsiVal, oversold)
+buySignal = buyMode == "Cross Below" ? crossBelow : crossBackAbove
+
+trendOK = useTrendFilter ? smaSlopeUp : true
+
+inSession = true
+if useTimeFilter
+    inSession := hour(time, "America/New_York") >= 9 and hour(time, "America/New_York") < 16
+
+// 백테스트 구간 필터
+inDateRange = time >= startDate and time <= endDate
+
+longCondition = buySignal and trendOK and volOK and inSession and inDateRange and strategy.position_size == 0
+
+// ============ KELLY SIZING ============
+totalClosedTrades = strategy.closedtrades
+winTrades = strategy.wintrades
+lossTrades = strategy.losstrades
+
+winRate = totalClosedTrades > 0 ? winTrades / totalClosedTrades : 0.0
+avgWin = winTrades > 0 ? strategy.grossprofit / winTrades : 0.0
+avgLoss = lossTrades > 0 ? strategy.grossloss / lossTrades : 0.0
+winLossRatio = avgLoss > 0 ? avgWin / avgLoss : 1.0
+
+kellyRaw = winLossRatio > 0 ? winRate - (1 - winRate) / winLossRatio : 0.0
+kellyRaw := math.max(kellyRaw, 0.0)
+
+kellySizePct = kellyRaw * kellyFraction * 100
+kellySizePct := math.min(math.max(kellySizePct, minPositionPct), maxPositionPct)
+
+effectiveSizePct = (useKelly and totalClosedTrades >= minTradesForKelly) ? kellySizePct : positionSizePct
+
+// ============ EXIT LOGIC ============
+var float peakRsiSinceEntry = na
+var float stopPriceFixed = na
+var bool partialTaken = false
+
+if strategy.position_size > 0
+    peakRsiSinceEntry := na(peakRsiSinceEntry) ? rsiVal : math.max(peakRsiSinceEntry, rsiVal)
+else
+    peakRsiSinceEntry := na
+    partialTaken := false
+
+rolloverExit = useRollover and not na(peakRsiSinceEntry) and peakRsiSinceEntry >= rolloverPeak and ta.crossunder(rsiVal, rolloverPeak - rolloverDrop)
+targetExit = ta.crossover(rsiVal, exitTarget)
+exitCondition = targetExit or rolloverExit
+
+partialExitSignal = usePartialTP and not partialTaken and strategy.position_size > 0 and ta.crossover(rsiVal, partialLevel)
+
+// ============ ENTRY / EXIT EXECUTION ============
+if longCondition
+    qtyToBuy = (strategy.equity * effectiveSizePct / 100) / close
+    strategy.entry("Long", strategy.long, qty=qtyToBuy)
+    rawStop = stopMode == "ATR" ? close - atrVal * atrMult : close * (1 - stopPct / 100)
+    cappedStop = close * (1 - maxStopPct / 100)
+    stopPriceFixed := math.max(rawStop, cappedStop)
+
+if strategy.position_size > 0
+    strategy.exit("Stop/Exit", "Long", stop=stopPriceFixed)
+    if partialExitSignal
+        strategy.close("Long", qty_percent=partialPct, comment="Partial TP")
+        partialTaken := true
+    if exitCondition
+        strategy.close("Long", comment=targetExit ? "RSI Target" : "Rollover")
+    if not inDateRange
+        strategy.close("Long", comment="End of Range")
+
+if strategy.position_size == 0
+    stopPriceFixed := na
+
+// ============ PLOTS ============
+plot(rsiVal, "RSI", color=color.new(color.blue, 0), linewidth=2)
+hline(oversold, "Oversold", color=color.red, linestyle=hline.style_dashed)
+hline(partialLevel, "Partial TP", color=color.purple, linestyle=hline.style_dotted)
+hline(exitTarget, "Exit Target", color=color.green, linestyle=hline.style_dashed)
+hline(rolloverPeak, "Rollover Peak", color=color.orange, linestyle=hline.style_dotted)
+
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 90) : na)
+
+// ============ ALERTS ============
+alertcondition(longCondition, "SOXL RSI Buy", "RSI Buy Signal")
+alertcondition(exitCondition, "SOXL RSI Sell", "RSI Sell Signal")
